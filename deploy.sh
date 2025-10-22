@@ -1,80 +1,124 @@
 #!/bin/bash
-
 # =========================================================
-# Samson's Docker + Nginx Deployment Script
+# 🚀 Samson's Stage 1 Bot-Compliant Deployment Script
 # =========================================================
 
-# Exit immediately if a command exits with a non-zero status
-set -e
+set -e  # Exit on any error
+trap 'echo "❌ An error occurred. Check the log for details."; exit 1' ERR
 
-# Log file location
-LOGFILE="/var/log/deploy.log"
-
-# Redirect stdout and stderr to log file and terminal
+# --- Log File Setup ---
+LOGFILE="deploy_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "$LOGFILE") 2>&1
 
 echo "========================================================="
-echo "🚀 Starting Deployment - $(date)"
+echo "🚀 Starting Automated Deployment - $(date)"
 echo "========================================================="
 
-# Step 1: Build Docker image
-echo "🔧 Building Docker image..."
-if sudo docker build -t myapp .; then
-  echo "✅ Docker image built successfully"
-else
-  echo "❌ Docker build failed" >&2
-  exit 1
+# --- STEP 1: Collect User Inputs ---
+read -p "Enter Git Repository URL: " GIT_URL
+read -p "Enter Git Personal Access Token (PAT): " PAT
+read -p "Enter Branch name (default: main): " BRANCH
+BRANCH=${BRANCH:-main}
+read -p "Enter Remote Server Username (e.g., ec2-user): " SSH_USER
+read -p "Enter Remote Server IP Address: " SSH_IP
+read -p "Enter path to SSH key (e.g., /home/user/mykey.pem): " SSH_KEY
+read -p "Enter Application port (container internal port, e.g., 8080): " APP_PORT
+
+# --- Input Validation ---
+if [[ -z "$GIT_URL" || -z "$PAT" || -z "$SSH_USER" || -z "$SSH_IP" || -z "$SSH_KEY" || -z "$APP_PORT" ]]; then
+    echo "❌ Error: All fields are required!"
+    exit 1
 fi
 
-# Step 2: Stop and remove any existing container
-echo "🧹 Cleaning up old containers..."
-if sudo docker ps -q --filter "name=myapp" | grep -q .; then
-  sudo docker stop myapp && sudo docker rm myapp
-  echo "✅ Old container removed"
+# --- STEP 2: Git Operations ---
+REPO_NAME=$(basename "$GIT_URL" .git)
+if [ -d "$REPO_NAME" ]; then
+    echo "📦 Repository exists. Pulling latest changes..."
+    cd "$REPO_NAME"
+    git pull
 else
-  echo "ℹ️ No old container found"
+    echo "📥 Cloning repository..."
+    git clone "https://${PAT}@${GIT_URL#https://}" "$REPO_NAME"
+    cd "$REPO_NAME"
 fi
 
-# Step 3: Run new container
-echo "🐳 Running new Docker container..."
-if sudo docker run -d --name myapp -p 8080:80 myapp; then
-  echo "✅ Docker container running successfully on port 8080"
-else
-  echo "❌ Failed to run Docker container" >&2
-  exit 1
-fi
+git checkout "$BRANCH"
+echo "✅ Git operations completed."
 
-# Step 4: Configure Nginx reverse proxy
-echo "🧠 Configuring Nginx reverse proxy..."
+# --- STEP 3: SSH Connectivity Check ---
+echo "🧠 Testing SSH connection to $SSH_USER@$SSH_IP ..."
+ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=5 "$SSH_USER@$SSH_IP" "echo SSH connection successful." || {
+    echo "❌ SSH connection failed"
+    exit 1
+}
 
-# Remove default config if it exists
-sudo rm -f /etc/nginx/conf.d/default.conf
+# --- STEP 4: Prepare Remote Server ---
+echo "⚙️ Preparing remote server..."
+ssh -i "$SSH_KEY" "$SSH_USER@$SSH_IP" <<EOF
+set -e
+echo "📦 Updating system packages..."
+sudo yum update -y
+echo "🐳 Installing Docker..."
+sudo amazon-linux-extras enable docker
+sudo yum install -y docker git nginx
+sudo systemctl enable docker
+sudo systemctl start docker
+sudo usermod -aG docker $SSH_USER
+EOF
 
-# Create new Nginx config file
-sudo bash -c 'cat > /etc/nginx/conf.d/dockerapp.conf <<EOF
+# --- STEP 5: Deploy Dockerized Application ---
+echo "🚀 Deploying Docker container..."
+scp -i "$SSH_KEY" -r . "$SSH_USER@$SSH_IP:/home/$SSH_USER/app"
+
+ssh -i "$SSH_KEY" "$SSH_USER@$SSH_IP" <<EOF
+cd /home/$SSH_USER/app
+sudo docker stop myapp || true
+sudo docker rm myapp || true
+sudo docker build -t myapp .
+sudo docker run -d -p $APP_PORT:80 --name myapp myapp
+EOF
+
+# --- STEP 6: Configure Nginx Reverse Proxy ---
+echo "🌍 Configuring Nginx..."
+ssh -i "$SSH_KEY" "$SSH_USER@$SSH_IP" <<EOF
+sudo tee /etc/nginx/conf.d/dockerapp.conf > /dev/null <<NGINXCONF
 server {
     listen 80;
     server_name _;
-
     location / {
-        proxy_pass http://localhost:8080;
+        proxy_pass http://localhost:$APP_PORT;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
     }
 }
-EOF'
+NGINXCONF
+sudo nginx -t
+sudo systemctl reload nginx
+EOF
 
-# Test and reload Nginx
-sudo nginx -t && sudo systemctl reload nginx
-
-echo "✅ Nginx reverse proxy configured successfully!"
-
-# Step 5: Verify everything
-echo "🔍 Checking running services..."
+# --- STEP 7: Deployment Validation ---
+echo "✅ Validating deployment..."
+ssh -i "$SSH_KEY" "$SSH_USER@$SSH_IP" <<EOF
+sudo systemctl status docker | grep active
 sudo docker ps
-sudo systemctl status nginx --no-pager
+curl -I localhost || echo "⚠️ App not reachable"
+EOF
 
-echo "========================================================="
-echo "🎉 Deployment completed successfully at $(date)"
-echo "========================================================="
+# --- STEP 8: Optional Cleanup ---
+if [[ "$1" == "--cleanup" ]]; then
+    echo "🧹 Cleaning up deployment..."
+    ssh -i "$SSH_KEY" "$SSH_USER@$SSH_IP" <<EOF
+sudo docker stop myapp || true
+sudo docker rm myapp || true
+sudo rm -rf /home/$SSH_USER/app
+sudo rm -f /etc/nginx/conf.d/dockerapp.conf
+sudo systemctl reload nginx
+EOF
+    echo "✅ Cleanup complete."
+    exit 0
+fi
+
+echo "🎉 Deployment complete! Logs saved in $LOGFILE"
 
